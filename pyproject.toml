@@ -10,4 +10,5 @@ dependencies = [
     "psutil>=7.2.2",
     "python-dotenv>=1.2.1",
     "tqdm>=4.67.1",
+    "typer>=0.21.1",
 ]
