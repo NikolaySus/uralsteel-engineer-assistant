@@ -149,19 +149,30 @@ class LightRagManager:
             return False
     
     async def insert_document(self, text: str, metadata: Dict[str, Any]) -> bool:
-        """Insert a single document with metadata."""
+        """Insert a single document with metadata using upload_document."""
         try:
-            # Use insert_texts (plural) which accepts documents with metadata
-            response = await self.client.insert_texts(
-                texts=[{
-                    "content": text,  # Note: the key is 'content' in the document object
-                    "metadata": metadata  # Include your metadata dictionary here
-                }]
+            # Skip empty documents
+            if not text.strip():
+                self.logger.warning("Skipping empty document")
+                return False
+            
+            # Use upload_document which supports metadata
+            response = await self.client.upload_document(
+                text=text,
+                metadata=metadata
             )
-            # Check response - expecting a list of document IDs
-            return bool(response and isinstance(response, list) and len(response) > 0)
+            
+            # Check response
+            if response and isinstance(response, dict) and "id" in response:
+                doc_id = response["id"]
+                self.logger.debug(f"Inserted document ID: {doc_id[:12]}...")
+                return True
+            else:
+                self.logger.error(f"No document ID returned: {response}")
+                return False
+                
         except Exception as e:
-            self.logger.error(f"Batch insert failed: {e}")
+            self.logger.error(f"Failed to insert document: {str(e)}")
             return False
 
 
