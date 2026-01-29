@@ -8,7 +8,7 @@ from tqdm.asyncio import tqdm_asyncio
 # --------------------------
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None  # or "your-api-key"
-ROOT_DIR = "/path/to/markdown/root"
+ROOT_DIR = "/root/rag-source/hierarchy_trailing_20260126_182731"
 CONCURRENCY = 5      # parallelism for insert_texts batches
 BATCH_SIZE = 5       # number of documents per batch for insert_texts
 
