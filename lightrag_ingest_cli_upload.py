@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
+"""
+LightRag Markdown Ingestion CLI
+
+This script ingests markdown files into LightRag service with proper
+concurrency control and processing status tracking.
+"""
+
 import asyncio
 import json
+import os
+import sys
+import time
+import argparse
 from pathlib import Path
-from multiprocessing import Process
-
-import typer
+import subprocess
 from lightrag.api import AsyncLightRagClient
 from tqdm.asyncio import tqdm_asyncio
-
-app = typer.Typer()
 
 # --------------------------
 # CONFIG
@@ -20,28 +27,11 @@ STATUS_FILE = Path("ingest_status.json")
 PROCESSING_STATUS_FILE = Path("processing_status.json")
 POLL_INTERVAL = 5  # seconds between status checks
 
-# LightRag API documentation reference
-# Based on investigation, we need to use insert_text() instead of upload_document()
-# for text content. The method signatures are:
-#
-# insert_text(text: str, file_source: str) -> InsertResponse
-#
-# The file_source parameter should contain the file path
-# insert_text() returns instantly and starts background processing
-# We need to track document processing status using the returned track_id
-# and respect concurrency limits to avoid rate limiting
-#
-# API methods for tracking:
-# - get_track_status(track_id) - track document processing status
-# - get_pipeline_status() - check overall pipeline status
-# - get_status_counts() - get document count by status
-#
-# upload_document() is designed for file uploads, not text content with metadata
-
 # --------------------------
 # HELPERS
 # --------------------------
 def collect_markdown_files(root: str):
+    """Collect all markdown files recursively from a directory"""
     return sorted(Path(root).rglob("*.md"))
 
 async def wait_for_capacity(client, max_concurrent: int):
@@ -58,11 +48,11 @@ async def wait_for_capacity(client, max_concurrent: int):
         await asyncio.sleep(POLL_INTERVAL)
 
 async def upload_one(semaphore, client, path: Path, status_file: Path, processing_status_file: Path):
+    """Upload a single document to LightRag"""
     async with semaphore:
         text = path.read_text(encoding="utf-8", errors="ignore")
 
-        # Use the file path as file_source as requested
-        # This will allow the system to track the source of the document
+        # Use the file path as file_source
         file_source = str(path)
 
         # Wait for capacity before uploading
@@ -86,11 +76,10 @@ async def upload_one(semaphore, client, path: Path, status_file: Path, processin
         }
         processing_status_file.write_text(json.dumps(processing_status, ensure_ascii=False))
 
-        # update status
+        # Update progress
         progress = json.loads(status_file.read_text(encoding="utf-8"))
         progress["processed"] += 1
         status_file.write_text(json.dumps(progress, ensure_ascii=False))
-
 
 async def check_processing_status(client, processing_status_file: Path):
     """Check and update processing status of documents"""
@@ -127,6 +116,7 @@ async def wait_for_processing_completion(client, processing_status_file: Path):
         await asyncio.sleep(POLL_INTERVAL)
 
 async def ingest_async(root_dir: str, status_file: Path):
+    """Main ingestion function"""
     files = collect_markdown_files(root_dir)
 
     # Initialize status files
@@ -159,32 +149,15 @@ async def ingest_async(root_dir: str, status_file: Path):
     finally:
         await client.close()
 
+def run_ingestion(root_dir: str):
+    """Run ingestion in async context"""
+    asyncio.run(ingest_async(root_dir, STATUS_FILE))
 
-def run_ingestion(root_dir: str, status_file: Path):
-    asyncio.run(ingest_async(root_dir, status_file))
-
-# --------------------------
-# CLI
-# --------------------------
-@app.command()
-def start(root_dir: str):
-    """
-    Start background ingestion
-    """
-    p = Process(target=run_ingestion, args=(root_dir, STATUS_FILE))
-    p.start()
-    print(f"🚀 Ingestion started (PID={p.pid})")
-    print("Use `status` to check progress")
-
-
-@app.command()
-def status():
-    """
-    Check ingestion status
-    """
+def show_status():
+    """Show ingestion status"""
     if not STATUS_FILE.exists():
         print("❌ No status file found")
-        raise typer.Exit(1)
+        return 1
 
     s = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
     pct = (s["processed"] / s["total"] * 100) if s["total"] else 0
@@ -209,5 +182,64 @@ def status():
             for status, count in status_counts.items():
                 print(f"  {status}: {count}")
 
+    return 0
+
+def start_background_ingestion(root_dir: str):
+    """Start ingestion as a background process that persists after SSH disconnect"""
+    # Create a wrapper script that runs the ingestion
+    wrapper_script = f"""#!/bin/bash
+# LightRag Ingestion Wrapper
+cd {os.getcwd()}
+nohup python -c "
+import sys;
+sys.path.insert(0, '.');
+from lightrag_ingest_cli_upload import run_ingestion;
+run_ingestion('{root_dir}')
+" > ingestion.log 2>&1 &
+echo $!
+"""
+
+    # Write wrapper script to file
+    wrapper_path = Path("ingest_wrapper.sh")
+    wrapper_path.write_text(wrapper_script)
+    wrapper_path.chmod(0o755)
+
+    # Execute the wrapper script and get PID
+    result = subprocess.run([str(wrapper_path)], capture_output=True, text=True, shell=True)
+    pid = result.stdout.strip()
+
+    if pid and pid.isdigit():
+        print(f"🚀 Ingestion started in background (PID={pid})")
+        print("Use `status` command to check progress")
+        print(f"Logs are being written to ingestion.log")
+        return 0
+    else:
+        print("❌ Failed to start ingestion process")
+        if result.stderr:
+            print(f"Error: {result.stderr}")
+        return 1
+
+def main():
+    """Main CLI entry point"""
+    parser = argparse.ArgumentParser(description="LightRag Markdown Ingestion CLI")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Start command
+    start_parser = subparsers.add_parser("start", help="Start background ingestion")
+    start_parser.add_argument("root_dir", help="Root directory containing markdown files")
+
+    # Status command
+    subparsers.add_parser("status", help="Check ingestion status")
+
+    args = parser.parse_args()
+
+    if args.command == "start":
+        return start_background_ingestion(args.root_dir)
+    elif args.command == "status":
+        return show_status()
+    else:
+        parser.print_help()
+        return 1
+
 if __name__ == "__main__":
-    app()
+    sys.exit(main())
