@@ -12,8 +12,8 @@ import os
 import sys
 import time
 import argparse
+import multiprocessing
 from pathlib import Path
-import subprocess
 from lightrag.api import AsyncLightRagClient
 from tqdm.asyncio import tqdm_asyncio
 
@@ -186,38 +186,37 @@ def show_status():
 
 def start_background_ingestion(root_dir: str):
     """Start ingestion as a background process that persists after SSH disconnect"""
-    # Create a wrapper script that runs the ingestion
-    wrapper_script = f"""#!/bin/bash
-# LightRag Ingestion Wrapper
-cd {os.getcwd()}
-nohup python -c "
-import sys;
-sys.path.insert(0, '.');
-from lightrag_ingest_cli_upload import run_ingestion;
-run_ingestion('{root_dir}')
-" > ingestion.log 2>&1 &
-echo $!
-"""
+    # Try Python-based approach first
+    try:
+        # Create a process that will run the ingestion
+        p = multiprocessing.Process(target=run_ingestion, args=(root_dir,))
+        p.start()
 
-    # Write wrapper script to file
-    wrapper_path = Path("ingest_wrapper.sh")
-    wrapper_path.write_text(wrapper_script)
-    wrapper_path.chmod(0o755)
-
-    # Execute the wrapper script and get PID
-    result = subprocess.run([str(wrapper_path)], capture_output=True, text=True, shell=True)
-    pid = result.stdout.strip()
-
-    if pid and pid.isdigit():
-        print(f"🚀 Ingestion started in background (PID={pid})")
+        print(f"🚀 Ingestion started in background (PID={p.pid})")
         print("Use `status` command to check progress")
-        print(f"Logs are being written to ingestion.log")
+        print("Note: This process may not persist after SSH disconnect on all systems")
         return 0
-    else:
-        print("❌ Failed to start ingestion process")
-        if result.stderr:
-            print(f"Error: {result.stderr}")
-        return 1
+    except Exception as e:
+        print(f"❌ Failed to start ingestion process with Python approach: {e}")
+
+        # Fallback to shell-based approach
+        print("Trying shell-based approach...")
+        try:
+            # Use nohup to ensure process persists after SSH disconnect
+            command = f"nohup python -c \"import sys; sys.path.insert(0, '.'); from lightrag_ingest_cli_upload import run_ingestion; run_ingestion('{root_dir}')\" > ingestion.log 2>&1 & echo $!"
+            result = os.system(command)
+
+            if result == 0:
+                print("🚀 Ingestion started in background using shell approach")
+                print("Use `status` command to check progress")
+                print("Logs are being written to ingestion.log")
+                return 0
+            else:
+                print("❌ Failed to start ingestion process with shell approach")
+                return 1
+        except Exception as e2:
+            print(f"❌ Failed to start ingestion process with shell approach: {e2}")
+            return 1
 
 def main():
     """Main CLI entry point"""
