@@ -2,7 +2,7 @@
 import asyncio
 import json
 from pathlib import Path
-from multiprocessing import Process, Manager
+from multiprocessing import Process
 from typing import List
 
 import typer
@@ -12,7 +12,7 @@ from tqdm.asyncio import tqdm_asyncio
 app = typer.Typer()
 
 # --------------------------
-# CONFIGURATION
+# CONFIG
 # --------------------------
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None
@@ -43,16 +43,21 @@ def prepare_batch(paths):
 async def ingest_batch(client, batch):
     await client.insert_texts(batch)
 
-async def bounded_ingest(semaphore, client, batch, progress_dict, idx):
+async def bounded_ingest(semaphore, client, batch, progress_dict_path: Path):
     async with semaphore:
         await ingest_batch(client, batch)
-        # update progress
-        progress_dict["processed"] += len(batch)
-        STATUS_FILE.write_text(json.dumps(progress_dict, ensure_ascii=False))
+        # update progress file
+        try:
+            progress = json.loads(progress_dict_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            progress = {"processed": 0, "total": 0, "done": False}
+        progress["processed"] += len(batch)
+        progress_dict_path.write_text(json.dumps(progress, ensure_ascii=False))
 
-async def ingest_async(root_dir: str, progress_dict):
+async def ingest_async(root_dir: str, progress_file: Path):
     files = collect_markdown_files(root_dir)
-    progress_dict["total"] = len(files)
+    progress = {"processed": 0, "total": len(files), "done": False}
+    progress_file.write_text(json.dumps(progress, ensure_ascii=False))
 
     batches = [files[i:i+BATCH_SIZE] for i in range(0, len(files), BATCH_SIZE)]
 
@@ -61,33 +66,29 @@ async def ingest_async(root_dir: str, progress_dict):
 
     try:
         tasks = [
-            bounded_ingest(semaphore, client, prepare_batch(batch), progress_dict, idx)
-            for idx, batch in enumerate(batches)
+            bounded_ingest(semaphore, client, prepare_batch(batch), progress_file)
+            for batch in batches
         ]
         await tqdm_asyncio.gather(*tasks)
-        progress_dict["done"] = True
-        STATUS_FILE.write_text(json.dumps(progress_dict, ensure_ascii=False))
+        # mark done
+        progress["done"] = True
+        progress_file.write_text(json.dumps(progress, ensure_ascii=False))
     finally:
         await client.close()
 
-
-def run_ingestion_process(root_dir: str, progress_dict):
-    asyncio.run(ingest_async(root_dir, progress_dict))
+def run_ingestion_process(root_dir: str, progress_file: Path):
+    asyncio.run(ingest_async(root_dir, progress_file))
 
 # --------------------------
-# CLI COMMANDS
+# CLI
 # --------------------------
 @app.command()
 def start(root_dir: str):
     """
     Start ingestion of markdown files in ROOT_DIR
     """
-    manager = Manager()
-    progress_dict = manager.dict({"processed": 0, "total": 0, "done": False})
-
-    p = Process(target=run_ingestion_process, args=(root_dir, progress_dict))
+    p = Process(target=run_ingestion_process, args=(root_dir, STATUS_FILE))
     p.start()
-
     print(f"🚀 Ingestion started as background process PID={p.pid}")
     print("Use `status` command to check progress")
 
@@ -106,11 +107,7 @@ def status():
     total = data.get("total", 0)
     done = data.get("done", False)
 
-    if total > 0:
-        percent = processed / total * 100
-    else:
-        percent = 0
-
+    percent = (processed / total * 100) if total > 0 else 0
     print(f"📊 Progress: {processed}/{total} ({percent:.1f}%)")
     print(f"✅ Done: {done}")
 
