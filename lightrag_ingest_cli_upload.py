@@ -15,7 +15,7 @@ app = typer.Typer()
 # --------------------------
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None
-CONCURRENCY = 8
+CONCURRENCY = 1
 STATUS_FILE = Path("ingest_status.json")
 
 # LightRag API documentation reference
