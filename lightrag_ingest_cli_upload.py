@@ -28,19 +28,22 @@ def collect_markdown_files(root: str) -> List[Path]:
     return sorted(Path(root).rglob("*.md"))
 
 def prepare_batch(paths: List[Path]) -> List[dict]:
-    """Prepare list of dicts for upload_document"""
     batch = []
     for p in paths:
         text = p.read_text(encoding="utf-8", errors="ignore")
         metadata = {
             "source_path": str(p),
-            "filename": p.name,
             "folder": str(p.parent),
             "filetype": "markdown",
             "language": "ru"
         }
-        batch.append({"text": text, "metadata": metadata})
+        batch.append({
+            "text": text,
+            "metadata": metadata,
+            "file_name": p.name  # <-- REQUIRED
+        })
     return batch
+
 
 async def bounded_ingest(semaphore, client, batch, progress_file: Path):
     """Upload a batch and update status file"""
