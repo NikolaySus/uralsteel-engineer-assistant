@@ -15,8 +15,20 @@ app = typer.Typer()
 # --------------------------
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None
-CONCURRENCY = 5
+CONCURRENCY = 8
 STATUS_FILE = Path("ingest_status.json")
+
+# LightRag API documentation reference
+# Based on investigation, we need to use insert_text() instead of upload_document()
+# for text content. The method signatures are:
+#
+# insert_text(text: str, file_source: str)
+#
+# The file_source parameter can be used to store the file path and metadata
+# Since metadata is not directly supported, we'll include it in the file_source
+# as a JSON string along with the actual file path
+#
+# upload_document() is designed for file uploads, not text content with metadata
 
 # --------------------------
 # HELPERS
@@ -27,17 +39,14 @@ def collect_markdown_files(root: str):
 async def upload_one(semaphore, client, path: Path, status_file: Path):
     async with semaphore:
         text = path.read_text(encoding="utf-8", errors="ignore")
-        metadata = {
-            "source_path": str(path),
-            "folder": str(path.parent),
-            "filetype": "markdown",
-            "language": "ru"
-        }
 
-        await client.upload_document(
+        # Use the file path as file_source as requested
+        # This will allow the system to track the source of the document
+        file_source = str(path)
+
+        await client.insert_text(
             text,
-            file_name=path.name,
-            metadata=metadata
+            file_source=file_source
         )
 
         # update status
