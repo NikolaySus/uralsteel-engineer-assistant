@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Start the LightRag ingestion process in the background.
+Start/stop LightRag ingestion daemon.
 """
 import os
 import sys
@@ -11,38 +11,31 @@ from pathlib import Path
 from config import Config
 
 
-def check_already_running(pid_file: Path) -> bool:
-    """Check if ingestion is already running."""
+def check_running(pid_file: Path) -> bool:
+    """Check if process is running."""
     if not pid_file.exists():
         return False
     
     try:
         with open(pid_file, 'r') as f:
             pid = int(f.read().strip())
-        
-        # Check if process is still running
-        try:
-            os.kill(pid, 0)  # Check if process exists
-            return True
-        except OSError:
-            return False
-    except (ValueError, OSError):
+        os.kill(pid, 0)  # Check if process exists
+        return True
+    except:
         return False
 
 
-def start_daemon(force: bool = False, skip_check: bool = False, root_dir: str = None, language: str = None):
-    """Start the ingestion daemon."""
+def start_daemon(force: bool = False, skip_check: bool = False):
+    """Start the daemon."""
     config = Config
     pid_file = config.get_pid_file()
     
-    # Check if already running
-    if check_already_running(pid_file):
+    if check_running(pid_file):
         print("⚠️  Ingestion is already running.")
-        print(f"   PID file: {pid_file}")
-        print("   Use 'python monitor.py status' to check progress")
+        print("   Use 'uv run monitor.py' to check progress")
         return False
     
-    # Create necessary directories
+    # Create directories
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     config.get_log_file().parent.mkdir(parents=True, exist_ok=True)
     config.get_progress_file().parent.mkdir(parents=True, exist_ok=True)
@@ -53,10 +46,6 @@ def start_daemon(force: bool = False, skip_check: bool = False, root_dir: str = 
         cmd.append("--force")
     if skip_check:
         cmd.append("--skip-check")
-    if root_dir:
-        cmd.extend(["--root-dir", root_dir])
-    if language:
-        cmd.extend(["--language", language])
     
     # Start process
     print("🚀 Starting LightRag ingestion daemon...")
@@ -69,9 +58,8 @@ def start_daemon(force: bool = False, skip_check: bool = False, root_dir: str = 
         log.write(f"Command: {' '.join(cmd)}\n")
         log.write(f"{'='*60}\n\n")
     
-    # Start the process
+    # Start process
     if sys.platform == "win32":
-        # Windows
         process = subprocess.Popen(
             cmd,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
@@ -80,7 +68,6 @@ def start_daemon(force: bool = False, skip_check: bool = False, root_dir: str = 
             start_new_session=True
         )
     else:
-        # Unix/Linux/Mac
         process = subprocess.Popen(
             cmd,
             stdout=open(log_file, 'a'),
@@ -94,13 +81,13 @@ def start_daemon(force: bool = False, skip_check: bool = False, root_dir: str = 
     
     print(f"✅ Daemon started with PID: {process.pid}")
     print(f"📝 Log file: {log_file}")
-    print("📊 Check progress with: python monitor.py")
+    print("📊 Monitor: uv run monitor.py")
     
     return True
 
 
 def stop_daemon():
-    """Stop the ingestion daemon."""
+    """Stop the daemon."""
     config = Config
     pid_file = config.get_pid_file()
     
@@ -112,7 +99,7 @@ def stop_daemon():
         with open(pid_file, 'r') as f:
             pid = int(f.read().strip())
         
-        print(f"🛑 Stopping ingestion process (PID: {pid})...")
+        print(f"🛑 Stopping process (PID: {pid})...")
         
         try:
             if sys.platform == "win32":
@@ -122,62 +109,42 @@ def stop_daemon():
                 os.kill(pid, signal.SIGTERM)
             
             # Wait for process to terminate
-            for _ in range(10):  # Wait up to 5 seconds
+            for _ in range(10):
                 try:
                     os.kill(pid, 0)
                     time.sleep(0.5)
                 except OSError:
                     break
-            
         except ProcessLookupError:
-            print(f"⚠️  Process {pid} not found")
+            pass
         
         # Remove PID file
-        if pid_file.exists():
-            pid_file.unlink()
-        
+        pid_file.unlink(missing_ok=True)
         print("✅ Process stopped.")
         return True
         
-    except (ValueError, OSError) as e:
-        print(f"❌ Failed to stop process: {e}")
-        if pid_file.exists():
-            pid_file.unlink()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        pid_file.unlink(missing_ok=True)
         return False
 
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Manage LightRag ingestion daemon")
+    parser = argparse.ArgumentParser(description="Manage ingestion daemon")
     parser.add_argument("action", choices=["start", "stop", "restart"],
                        help="Action to perform")
-    parser.add_argument("--force", action="store_true",
-                       help="Force re-ingestion when starting")
-    parser.add_argument("--skip-check", action="store_true",
-                       help="Skip document check when starting")
-    parser.add_argument("--root-dir", type=str,
-                       help="Override the MARKDOWN_ROOT_DIR from .env file")
-    parser.add_argument("--language", type=str,
-                       help="Override the LANGUAGE from .env file")
+    parser.add_argument("--force", action="store_true", help="Force re-ingestion")
+    parser.add_argument("--skip-check", action="store_true", help="Skip document check")
     
     args = parser.parse_args()
     
     if args.action == "start":
-        start_daemon(
-            force=args.force, 
-            skip_check=args.skip_check,
-            root_dir=args.root_dir,
-            language=args.language
-        )
+        start_daemon(force=args.force, skip_check=args.skip_check)
     elif args.action == "stop":
         stop_daemon()
     elif args.action == "restart":
         stop_daemon()
         time.sleep(1)
-        start_daemon(
-            force=args.force, 
-            skip_check=args.skip_check,
-            root_dir=args.root_dir,
-            language=args.language
-        )
+        start_daemon(force=args.force, skip_check=args.skip_check)

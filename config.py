@@ -11,7 +11,6 @@ load_dotenv()
 class Config:
     """Configuration loader with defaults."""
     
-    # LightRag
     @staticmethod
     def get_lightrag_url() -> str:
         return os.getenv("LIGHTRAG_URL", "http://localhost:9621")
@@ -20,7 +19,6 @@ class Config:
     def get_api_key() -> Optional[str]:
         return os.getenv("LIGHTRAG_API_KEY")
     
-    # Ingestion
     @staticmethod
     def get_root_dir() -> str:
         root = os.getenv("MARKDOWN_ROOT_DIR")
@@ -42,11 +40,10 @@ class Config:
     @staticmethod
     def get_batch_size() -> int:
         try:
-            return int(os.getenv("QUERY_BATCH_SIZE", "40"))
+            return int(os.getenv("QUERY_BATCH_SIZE", "1000"))
         except ValueError:
-            return 40
+            return 1000
     
-    # Process
     @staticmethod
     def get_log_level() -> str:
         return os.getenv("LOG_LEVEL", "INFO")
@@ -63,7 +60,6 @@ class Config:
     def get_progress_file() -> Path:
         return Path(os.getenv("PROGRESS_FILE", "tmp/ingestion_progress.json"))
     
-    # Features
     @staticmethod
     def get_force_reingest() -> bool:
         return os.getenv("FORCE_REINGEST", "false").lower() == "true"
