@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import time
+import signal
 from pathlib import Path
 from config import Config
 
@@ -20,27 +21,16 @@ def check_already_running(pid_file: Path) -> bool:
             pid = int(f.read().strip())
         
         # Check if process is still running
-        if sys.platform == "win32":
-            # Windows
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(1, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
+        try:
+            os.kill(pid, 0)  # Check if process exists
+            return True
+        except OSError:
             return False
-        else:
-            # Unix/Linux/Mac
-            try:
-                os.kill(pid, 0)
-                return True
-            except OSError:
-                return False
     except (ValueError, OSError):
         return False
 
 
-def start_daemon(force: bool = False, skip_check: bool = False):
+def start_daemon(force: bool = False, skip_check: bool = False, root_dir: str = None, language: str = None):
     """Start the ingestion daemon."""
     config = Config
     pid_file = config.get_pid_file()
@@ -63,25 +53,38 @@ def start_daemon(force: bool = False, skip_check: bool = False):
         cmd.append("--force")
     if skip_check:
         cmd.append("--skip-check")
+    if root_dir:
+        cmd.extend(["--root-dir", root_dir])
+    if language:
+        cmd.extend(["--language", language])
     
     # Start process
     print("🚀 Starting LightRag ingestion daemon...")
     
+    # Redirect output to log file
+    log_file = config.get_log_file()
+    with open(log_file, 'a') as log:
+        log.write(f"\n{'='*60}\n")
+        log.write(f"Ingestion started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Command: {' '.join(cmd)}\n")
+        log.write(f"{'='*60}\n\n")
+    
+    # Start the process
     if sys.platform == "win32":
-        # Windows - use CREATE_NEW_PROCESS_GROUP
+        # Windows
         process = subprocess.Popen(
             cmd,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
             start_new_session=True
         )
     else:
         # Unix/Linux/Mac
         process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
             start_new_session=True
         )
     
@@ -90,7 +93,7 @@ def start_daemon(force: bool = False, skip_check: bool = False):
         f.write(str(process.pid))
     
     print(f"✅ Daemon started with PID: {process.pid}")
-    print(f"📝 Log file: {config.get_log_file()}")
+    print(f"📝 Log file: {log_file}")
     print("📊 Check progress with: python monitor.py")
     
     return True
@@ -111,23 +114,35 @@ def stop_daemon():
         
         print(f"🛑 Stopping ingestion process (PID: {pid})...")
         
-        if sys.platform == "win32":
-            import signal
-            os.kill(pid, signal.CTRL_BREAK_EVENT)
-        else:
-            os.kill(pid, signal.SIGTERM)
-        
-        # Wait a bit for graceful shutdown
-        time.sleep(2)
+        try:
+            if sys.platform == "win32":
+                import signal
+                os.kill(pid, signal.CTRL_BREAK_EVENT)
+            else:
+                os.kill(pid, signal.SIGTERM)
+            
+            # Wait for process to terminate
+            for _ in range(10):  # Wait up to 5 seconds
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.5)
+                except OSError:
+                    break
+            
+        except ProcessLookupError:
+            print(f"⚠️  Process {pid} not found")
         
         # Remove PID file
-        pid_file.unlink(missing_ok=True)
+        if pid_file.exists():
+            pid_file.unlink()
+        
         print("✅ Process stopped.")
         return True
         
     except (ValueError, OSError) as e:
         print(f"❌ Failed to stop process: {e}")
-        pid_file.unlink(missing_ok=True)
+        if pid_file.exists():
+            pid_file.unlink()
         return False
 
 
@@ -141,14 +156,28 @@ if __name__ == "__main__":
                        help="Force re-ingestion when starting")
     parser.add_argument("--skip-check", action="store_true",
                        help="Skip document check when starting")
+    parser.add_argument("--root-dir", type=str,
+                       help="Override the MARKDOWN_ROOT_DIR from .env file")
+    parser.add_argument("--language", type=str,
+                       help="Override the LANGUAGE from .env file")
     
     args = parser.parse_args()
     
     if args.action == "start":
-        start_daemon(force=args.force, skip_check=args.skip_check)
+        start_daemon(
+            force=args.force, 
+            skip_check=args.skip_check,
+            root_dir=args.root_dir,
+            language=args.language
+        )
     elif args.action == "stop":
         stop_daemon()
     elif args.action == "restart":
         stop_daemon()
         time.sleep(1)
-        start_daemon(force=args.force, skip_check=args.skip_check)
+        start_daemon(
+            force=args.force, 
+            skip_check=args.skip_check,
+            root_dir=args.root_dir,
+            language=args.language
+        )

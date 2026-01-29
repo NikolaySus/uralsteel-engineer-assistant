@@ -8,9 +8,10 @@ import json
 import logging
 import signal
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Set, Any, Optional
 
 from lightrag.api import AsyncLightRagClient
 from tqdm.asyncio import tqdm_asyncio
@@ -32,7 +33,7 @@ class ProgressTracker:
             "skipped": 0,
             "deleted": 0,
             "current_file": None,
-            "status": "starting",  # starting, running, completed, failed
+            "status": "starting",  # starting, running, completed, failed, interrupted
             "completed_at": None,
             "files": {}
         }
@@ -103,6 +104,9 @@ class IngestionDaemon:
         logger = logging.getLogger('ingestion_daemon')
         logger.setLevel(self.config.get_log_level())
         
+        # Clear existing handlers
+        logger.handlers.clear()
+        
         # File handler
         file_handler = logging.FileHandler(log_file)
         file_formatter = logging.Formatter(
@@ -119,31 +123,28 @@ class IngestionDaemon:
         
         return logger
     
-    async def get_indexed_documents_with_ids(self) -> Dict[str, str]:
-        """Query LightRag for already indexed documents."""
+    async def get_indexed_documents(self) -> Dict[str, str]:
+        """Query LightRag for already indexed documents and return mapping: source_path -> document_id."""
         indexed_docs = {}
-        page_token = None
         
         self.logger.info("Checking for already indexed documents...")
         
         try:
-            while True:
-                response = await self.client.query_documents(
-                    query="",
-                    top_k=self.config.get_batch_size(),
-                    metadata_filters={},
-                    page_token=page_token
-                )
-                
-                for doc in response.get("documents", []):
-                    metadata = doc.get("metadata", {})
+            # Use query instead of query_documents with empty query
+            response = await self.client.query(
+                query="",  # Empty query to get all documents
+                top_k=self.config.get_batch_size(),
+                space="default"
+            )
+            
+            if "hits" in response:
+                for hit in response["hits"]:
+                    metadata = hit.get("metadata", {})
                     if "source_path" in metadata:
-                        indexed_docs[metadata["source_path"]] = doc.get("id")
-                
-                page_token = response.get("next_page_token")
-                if not page_token:
-                    break
-                    
+                        doc_id = hit.get("id")
+                        if doc_id:
+                            indexed_docs[metadata["source_path"]] = doc_id
+            
         except Exception as e:
             self.logger.error(f"Could not query existing documents: {e}")
             return {}
@@ -154,11 +155,19 @@ class IngestionDaemon:
     async def delete_document_by_id(self, doc_id: str) -> bool:
         """Delete a document by its ID."""
         try:
-            await self.client.delete_document(doc_id=doc_id)
+            await self.client.delete(doc_id=doc_id)
             return True
         except Exception as e:
             self.logger.error(f"Failed to delete document {doc_id}: {e}")
             return False
+    
+    async def delete_documents_by_ids(self, doc_ids: List[str]) -> int:
+        """Delete multiple documents by their IDs."""
+        successful = 0
+        for doc_id in doc_ids:
+            if await self.delete_document_by_id(doc_id):
+                successful += 1
+        return successful
     
     async def ingest_one(self, md_path: Path, language: str = "en") -> bool:
         """Ingest a single markdown file."""
@@ -182,17 +191,45 @@ class IngestionDaemon:
         }
         
         try:
-            await self.client.insert_document(
-                text=text,
-                metadata=metadata
+            # Use insert_documents (plural) with a list
+            response = await self.client.insert_documents(
+                documents=[{
+                    "text": text,
+                    "metadata": metadata
+                }]
             )
-            self.progress_tracker.finish_file(filepath, True)
-            return True
+            
+            # Check if insertion was successful
+            if response and "ids" in response and len(response["ids"]) > 0:
+                self.progress_tracker.finish_file(filepath, True)
+                return True
+            else:
+                error_msg = "No document ID returned"
+                self.logger.error(f"{filepath}: {error_msg}")
+                self.progress_tracker.finish_file(filepath, False, error_msg)
+                return False
+                
         except Exception as e:
             error_msg = f"Failed to ingest: {e}"
             self.logger.error(f"{filepath}: {error_msg}")
             self.progress_tracker.finish_file(filepath, False, error_msg)
             return False
+    
+    async def ingest_batch(self, batch: List[Path], language: str) -> tuple[int, int]:
+        """Ingest a batch of files."""
+        successful = 0
+        failed = 0
+        
+        for md_path in batch:
+            if self.shutdown_requested:
+                break
+                
+            if await self.ingest_one(md_path, language):
+                successful += 1
+            else:
+                failed += 1
+        
+        return successful, failed
     
     async def bounded_ingest(self, semaphore, md_path, language):
         """Ingest with concurrency control."""
@@ -201,7 +238,12 @@ class IngestionDaemon:
     
     def collect_markdown_files(self, root: str) -> List[Path]:
         """Collect all markdown files recursively."""
-        return sorted(Path(root).rglob("*.md"))
+        try:
+            files = sorted(Path(root).rglob("*.md"))
+            return files
+        except Exception as e:
+            self.logger.error(f"Failed to collect files from {root}: {e}")
+            return []
     
     def signal_handler(self, signum, frame):
         """Handle shutdown signals."""
@@ -229,10 +271,20 @@ class IngestionDaemon:
         
         self.logger.info(f"Found {len(files)} markdown files")
         
-        self.client = AsyncLightRagClient(
-            base_url=self.config.get_lightrag_url(),
-            api_key=self.config.get_api_key()
-        )
+        try:
+            self.client = AsyncLightRagClient(
+                base_url=self.config.get_lightrag_url(),
+                api_key=self.config.get_api_key()
+            )
+            
+            # Test connection
+            await self.client.health()
+            self.logger.info("Connected to LightRag successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to connect to LightRag: {e}")
+            self.progress_tracker.update_status("failed")
+            return
         
         try:
             files_to_process = files
@@ -241,23 +293,32 @@ class IngestionDaemon:
             if not skip_check:
                 if force:
                     # Force mode: delete all existing documents
-                    indexed_docs = await self.get_indexed_documents_with_ids()
+                    indexed_docs = await self.get_indexed_documents()
                     
                     if indexed_docs:
                         self.logger.info(f"Deleting {len(indexed_docs)} existing documents...")
-                        delete_tasks = [
-                            self.delete_document_by_id(doc_id)
-                            for doc_id in indexed_docs.values()
-                        ]
                         
-                        results = await asyncio.gather(*delete_tasks)
-                        deleted_count = sum(1 for r in results if r)
+                        # Delete in batches to avoid overwhelming the API
+                        doc_ids = list(indexed_docs.values())
+                        batch_size = 20
+                        
+                        for i in range(0, len(doc_ids), batch_size):
+                            if self.shutdown_requested:
+                                break
+                                
+                            batch = doc_ids[i:i + batch_size]
+                            deleted_in_batch = await self.delete_documents_by_ids(batch)
+                            deleted_count += deleted_in_batch
+                            
+                            if len(doc_ids) > batch_size:
+                                self.logger.info(f"Deleted {i + deleted_in_batch}/{len(doc_ids)} documents...")
+                        
                         self.logger.info(f"Deleted {deleted_count} documents")
                     
                     files_to_process = files
                 else:
                     # Normal mode: skip already indexed files
-                    indexed_docs = await self.get_indexed_documents_with_ids()
+                    indexed_docs = await self.get_indexed_documents()
                     
                     files_to_process = [
                         f for f in files 
@@ -269,6 +330,7 @@ class IngestionDaemon:
                         self.logger.info(f"Skipping {skipped_count} already indexed files")
             else:
                 self.logger.info("Skipping document check")
+                skipped_count = 0
             
             if not files_to_process:
                 self.logger.info("All documents are already indexed")
@@ -278,44 +340,46 @@ class IngestionDaemon:
             self.progress_tracker.update_file_count(
                 total=len(files),
                 to_process=len(files_to_process),
-                skipped=len(files) - len(files_to_process)
+                skipped=skipped_count
             )
             
             self.logger.info(f"Processing {len(files_to_process)} files...")
             
+            # Process files
             semaphore = asyncio.Semaphore(self.config.get_concurrency())
             
-            # Process files in batches to allow graceful shutdown
-            batch_size = 50
-            for i in range(0, len(files_to_process), batch_size):
+            # Create tasks for all files
+            tasks = [
+                self.bounded_ingest(semaphore, md_path, language)
+                for md_path in files_to_process
+            ]
+            
+            # Process with progress bar
+            results = []
+            for i in range(0, len(tasks), self.config.get_concurrency()):
                 if self.shutdown_requested:
-                    self.logger.info("Shutdown requested, stopping ingestion...")
                     break
+                    
+                batch_tasks = tasks[i:i + self.config.get_concurrency()]
+                batch_results = await asyncio.gather(*batch_tasks)
+                results.extend(batch_results)
                 
-                batch = files_to_process[i:i + batch_size]
-                self.logger.info(f"Processing batch {i//batch_size + 1}/{(len(files_to_process)-1)//batch_size + 1}")
-                
-                tasks = [
-                    self.bounded_ingest(semaphore, md_path, language)
-                    for md_path in batch
-                ]
-                
-                results = await tqdm_asyncio.gather(*tasks)
-                
-                successful = sum(1 for r in results if r)
-                failed = len(results) - successful
-                
-                self.logger.info(f"Batch completed: {successful} successful, {failed} failed")
+                # Update progress
+                processed_so_far = i + len(batch_tasks)
+                self.logger.info(f"Progress: {processed_so_far}/{len(tasks)} files")
+            
+            successful = sum(1 for r in results if r)
+            failed = len(results) - successful
             
             if self.shutdown_requested:
                 self.progress_tracker.update_status("interrupted")
                 self.logger.info("Ingestion interrupted by user")
             else:
                 self.progress_tracker.update_status("completed")
-                self.logger.info("Ingestion completed successfully")
+                self.logger.info(f"Ingestion completed: {successful} successful, {failed} failed")
                 
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error: {e}", exc_info=True)
             self.progress_tracker.update_status("failed")
             raise
         finally:
@@ -332,6 +396,10 @@ async def main():
                        help="Force re-ingestion")
     parser.add_argument("--skip-check", action="store_true",
                        help="Skip document check")
+    parser.add_argument("--root-dir", type=str,
+                       help="Override the MARKDOWN_ROOT_DIR from .env file")
+    parser.add_argument("--language", type=str,
+                       help="Override the LANGUAGE from .env file")
     args = parser.parse_args()
     
     daemon = IngestionDaemon()

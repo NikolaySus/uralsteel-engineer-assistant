@@ -42,9 +42,9 @@ class Config:
     @staticmethod
     def get_batch_size() -> int:
         try:
-            return int(os.getenv("QUERY_BATCH_SIZE", "1000"))
+            return int(os.getenv("QUERY_BATCH_SIZE", "40"))
         except ValueError:
-            return 1000
+            return 40
     
     # Process
     @staticmethod
