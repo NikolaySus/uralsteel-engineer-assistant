@@ -13,6 +13,8 @@ import sys
 import time
 import argparse
 import multiprocessing
+import subprocess
+import psutil
 from pathlib import Path
 from lightrag.api import AsyncLightRagClient
 from tqdm.asyncio import tqdm_asyncio
@@ -79,6 +81,7 @@ async def upload_one(semaphore, client, path: Path, status_file: Path, processin
         # Update progress
         progress = json.loads(status_file.read_text(encoding="utf-8"))
         progress["processed"] += 1
+        progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
         status_file.write_text(json.dumps(progress, ensure_ascii=False))
 
 async def check_processing_status(client, processing_status_file: Path):
@@ -123,7 +126,8 @@ async def ingest_async(root_dir: str, status_file: Path):
     status_file.write_text(json.dumps({
         "processed": 0,
         "total": len(files),
-        "done": False
+        "done": False,
+        "last_modified": time.strftime("%Y-%m-%d %H:%M:%S")
     }, ensure_ascii=False))
 
     PROCESSING_STATUS_FILE.write_text(json.dumps({}, ensure_ascii=False))
@@ -145,6 +149,7 @@ async def ingest_async(root_dir: str, status_file: Path):
         # Mark as done
         progress = json.loads(status_file.read_text(encoding="utf-8"))
         progress["done"] = True
+        progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
         status_file.write_text(json.dumps(progress, ensure_ascii=False))
     finally:
         await client.close()
@@ -152,6 +157,78 @@ async def ingest_async(root_dir: str, status_file: Path):
 def run_ingestion(root_dir: str):
     """Run ingestion in async context"""
     asyncio.run(ingest_async(root_dir, STATUS_FILE))
+
+def find_ingestion_process():
+    """Find the ingestion process using psutil"""
+    current_script = os.path.abspath(__file__)
+    current_dir = os.getcwd()
+
+    for proc in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            cmdline = proc.info['cmdline']
+            if cmdline and len(cmdline) > 1:
+                # Check if this process is running our ingestion script
+                if (any('lightrag_ingest_cli_upload.py' in arg for arg in cmdline) or
+                    any('run_ingestion' in arg for arg in cmdline) or
+                    any('from lightrag_ingest_cli_upload import run_ingestion' in arg for arg in cmdline)):
+                    return proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return None
+
+def stop_ingestion():
+    """Stop the background ingestion process"""
+    # Check if status file exists to confirm ingestion is running
+    if not STATUS_FILE.exists():
+        print("❌ No active ingestion found")
+        return 1
+
+    # Try to find the ingestion process
+    proc = find_ingestion_process()
+
+    if proc:
+        try:
+            # Terminate the process and all its children
+            for child in proc.children(recursive=True):
+                try:
+                    child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            proc.terminate()
+
+            # Wait for process to terminate
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                # Force kill if process doesn't terminate
+                proc.kill()
+
+            print(f"✅ Ingestion process (PID={proc.pid}) stopped successfully")
+
+            # Clean up status files
+            if STATUS_FILE.exists():
+                STATUS_FILE.unlink()
+            if PROCESSING_STATUS_FILE.exists():
+                PROCESSING_STATUS_FILE.unlink()
+
+            print("🧹 Status files cleaned up")
+            return 0
+        except Exception as e:
+            print(f"❌ Failed to stop ingestion process: {e}")
+            return 1
+    else:
+        print("❌ No running ingestion process found")
+        print("Note: If ingestion was started in a different session, you may need to stop it manually")
+
+        # Offer to clean up status files
+        if input("Would you like to clean up status files? [y/N]: ").lower() == 'y':
+            if STATUS_FILE.exists():
+                STATUS_FILE.unlink()
+            if PROCESSING_STATUS_FILE.exists():
+                PROCESSING_STATUS_FILE.unlink()
+            print("🧹 Status files cleaned up")
+        return 1
 
 def show_status():
     """Show ingestion status"""
@@ -163,6 +240,7 @@ def show_status():
     pct = (s["processed"] / s["total"] * 100) if s["total"] else 0
     print(f"📊 Overall Progress: {s['processed']} / {s['total']} ({pct:.1f}%)")
     print(f"✅ Ingestion Done: {s['done']}")
+    print(f"🕒 Last Updated: {s.get('last_modified', 'Unknown')}")
 
     # Show detailed processing status if available
     if PROCESSING_STATUS_FILE.exists():
@@ -186,36 +264,56 @@ def show_status():
 
 def start_background_ingestion(root_dir: str):
     """Start ingestion as a background process that persists after SSH disconnect"""
-    # Try Python-based approach first
-    try:
-        # Create a process that will run the ingestion
-        p = multiprocessing.Process(target=run_ingestion, args=(root_dir,))
-        p.start()
+    # Check if we're on Windows
+    is_windows = sys.platform.startswith('win')
 
-        print(f"🚀 Ingestion started in background (PID={p.pid})")
-        print("Use `status` command to check progress")
-        print("Note: This process may not persist after SSH disconnect on all systems")
-        return 0
-    except Exception as e:
-        print(f"❌ Failed to start ingestion process with Python approach: {e}")
-
-        # Fallback to shell-based approach
-        print("Trying shell-based approach...")
+    if is_windows:
         try:
-            # Use nohup to ensure process persists after SSH disconnect
-            command = f"nohup python -c \"import sys; sys.path.insert(0, '.'); from lightrag_ingest_cli_upload import run_ingestion; run_ingestion('{root_dir}')\" > ingestion.log 2>&1 & echo $!"
+            # Windows approach using start command
+            script_path = os.path.abspath(__file__)
+            current_dir = os.getcwd()
+
+            # Use start command to launch in background
+            command = f'start /B python -c "import sys, os; os.chdir(\'{current_dir}\'); sys.path.insert(0, \'.\'); from lightrag_ingest_cli_upload import run_ingestion; run_ingestion(\'{root_dir}\')""'
             result = os.system(command)
 
             if result == 0:
-                print("🚀 Ingestion started in background using shell approach")
+                print("🚀 Ingestion started in background on Windows")
                 print("Use `status` command to check progress")
-                print("Logs are being written to ingestion.log")
                 return 0
             else:
-                print("❌ Failed to start ingestion process with shell approach")
+                print("❌ Failed to start ingestion process on Windows")
                 return 1
-        except Exception as e2:
-            print(f"❌ Failed to start ingestion process with shell approach: {e2}")
+        except Exception as e:
+            print(f"❌ Failed to start ingestion process on Windows: {e}")
+            return 1
+    else:
+        # Unix/Linux approach using psutil for proper process detachment
+        try:
+            # Start a fully detached process using psutil
+            current_dir = os.getcwd()
+
+            # Create a command that will run in a detached process
+            command = [
+                sys.executable,
+                "-c",
+                f"import sys, os; os.chdir('{current_dir}'); sys.path.insert(0, '.'); from lightrag_ingest_cli_upload import run_ingestion; run_ingestion('{root_dir}')"
+            ]
+
+            # Start a fully detached process
+            process = psutil.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True  # This detaches the process
+            )
+
+            print(f"🚀 Ingestion started in background (PID={process.pid})")
+            print("Use `status` command to check progress")
+            print("Process is fully detached and will persist after SSH disconnect")
+            return 0
+        except Exception as e:
+            print(f"❌ Failed to start ingestion process: {e}")
             return 1
 
 def main():
@@ -230,12 +328,17 @@ def main():
     # Status command
     subparsers.add_parser("status", help="Check ingestion status")
 
+    # Stop command
+    subparsers.add_parser("stop", help="Stop background ingestion")
+
     args = parser.parse_args()
 
     if args.command == "start":
         return start_background_ingestion(args.root_dir)
     elif args.command == "status":
         return show_status()
+    elif args.command == "stop":
+        return stop_ingestion()
     else:
         parser.print_help()
         return 1
