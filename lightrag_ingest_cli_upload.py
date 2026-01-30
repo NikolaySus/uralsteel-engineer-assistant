@@ -162,16 +162,36 @@ def find_ingestion_process():
     """Find the ingestion process using psutil"""
     current_script = os.path.abspath(__file__)
     current_dir = os.getcwd()
+    current_pid = os.getpid()  # Get current process PID to exclude it
 
-    for proc in psutil.process_iter(['pid', 'cmdline']):
+    for proc in psutil.process_iter(['pid', 'cmdline', 'name']):
         try:
             cmdline = proc.info['cmdline']
-            if cmdline and len(cmdline) > 1:
-                # Check if this process is running our ingestion script
-                if (any('lightrag_ingest_cli_upload.py' in arg for arg in cmdline) or
-                    any('run_ingestion' in arg for arg in cmdline) or
-                    any('from lightrag_ingest_cli_upload import run_ingestion' in arg for arg in cmdline)):
-                    return proc
+            pid = proc.info['pid']
+
+            # Skip the current process (status command)
+            if pid == current_pid:
+                continue
+
+            # Skip if no command line
+            if not cmdline or len(cmdline) < 1:
+                continue
+
+            # More specific checks for ingestion process
+            # Check for Python process running our script
+            if (any('lightrag_ingest_cli_upload.py' in arg for arg in cmdline) and
+                any('run_ingestion' in arg for arg in cmdline)):
+                return proc
+
+            # Check for process started with the specific command pattern
+            if (len(cmdline) >= 2 and cmdline[0].endswith('python') and
+                any('from lightrag_ingest_cli_upload import run_ingestion' in arg for arg in cmdline)):
+                return proc
+
+            # Check for process running the specific ingestion function
+            if any('run_ingestion' in arg for arg in cmdline) and not any('status' in arg for arg in cmdline):
+                return proc
+
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
     return None
@@ -244,13 +264,47 @@ def show_status():
 
     # Check if the ingestion process still exists
     proc = find_ingestion_process()
+
+    # Check for recent activity by examining file timestamps
+    status_age = 0
+    if 'last_modified' in s:
+        try:
+            last_modified_time = time.strptime(s['last_modified'], "%Y-%m-%d %H:%M:%S")
+            status_age = (time.time() - time.mktime(last_modified_time)) / 60  # in minutes
+        except:
+            pass
+
+    # Check if processing status file exists and has active documents
+    active_processing = False
+    if PROCESSING_STATUS_FILE.exists():
+        try:
+            processing_status = json.loads(PROCESSING_STATUS_FILE.read_text(encoding="utf-8"))
+            for doc_info in processing_status.values():
+                if doc_info.get("status") in ["pending", "processing", "preprocessed"]:
+                    active_processing = True
+                    break
+        except:
+            pass
+
+    # Determine process status
     if proc:
         print(f"🔄 Process Status: Running (PID={proc.pid})")
+        if status_age > 5 and not active_processing and s['processed'] < s['total']:
+            print("⚠️  Warning: Process running but no recent activity detected")
     else:
         if s.get('done', False):
             print("🔄 Process Status: Completed")
         else:
             print("⚠️  Process Status: Not found (may have crashed or been stopped)")
+            if status_age > 5 and not active_processing:
+                print("ℹ️  No recent activity detected in status files")
+
+    # Add troubleshooting suggestion if process is not found but status shows incomplete
+    if not proc and not s.get('done', False) and s['processed'] < s['total']:
+        print("\n💡 Troubleshooting:")
+        print("   • Try starting ingestion again with 'start' command")
+        print("   • Check if LightRag service is running")
+        print("   • Verify network connectivity to LightRag")
 
     # Show detailed processing status if available
     if PROCESSING_STATUS_FILE.exists():
