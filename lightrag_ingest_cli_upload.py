@@ -24,7 +24,7 @@ from tqdm.asyncio import tqdm_asyncio
 # --------------------------
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None
-CONCURRENCY = 1  # Reduced concurrency to avoid rate limiting
+CONCURRENCY = 8  # Reduced concurrency to avoid rate limiting
 STATUS_FILE = Path("ingest_status.json")
 PROCESSING_STATUS_FILE = Path("processing_status.json")
 POLL_INTERVAL = 5  # seconds between status checks
