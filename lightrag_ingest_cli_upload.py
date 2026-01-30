@@ -24,7 +24,7 @@ from tqdm.asyncio import tqdm_asyncio
 # --------------------------
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None
-CONCURRENCY = 8  # Reduced concurrency to avoid rate limiting
+CONCURRENCY = 4  # Reduced concurrency to avoid rate limiting
 STATUS_FILE = Path("ingest_status.json")
 PROCESSING_STATUS_FILE = Path("processing_status.json")
 POLL_INTERVAL = 5  # seconds between status checks
@@ -39,15 +39,19 @@ def collect_markdown_files(root: str):
 async def wait_for_capacity(client, max_concurrent: int):
     """Wait until there's capacity in the processing pipeline"""
     while True:
-        status_counts = await client.get_status_counts()
-        # Count documents that are still processing (not processed or failed)
-        processing_count = sum(
-            count for status, count in status_counts.status_counts.items()
-            if status in ["pending", "processing", "preprocessed"]
-        )
-        if processing_count < max_concurrent:
-            break
-        await asyncio.sleep(POLL_INTERVAL)
+        try:
+            status_counts = await client.get_status_counts()
+            # Count documents that are still processing (not processed or failed)
+            processing_count = sum(
+                count for status, count in status_counts.status_counts.items()
+                if status in ["pending", "processing", "preprocessed"]
+            )
+            if processing_count < max_concurrent:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to check capacity, retrying... Error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
 async def upload_one(semaphore, client, path: Path, status_file: Path, processing_status_file: Path):
     """Upload a single document to LightRag"""
@@ -56,33 +60,68 @@ async def upload_one(semaphore, client, path: Path, status_file: Path, processin
 
         # Use the file path as file_source
         file_source = str(path)
+        max_retries = 3
+        retry_delay = 2  # seconds
 
-        # Wait for capacity before uploading
-        await wait_for_capacity(client, CONCURRENCY)
+        for attempt in range(max_retries):
+            try:
+                # Wait for capacity before uploading
+                await wait_for_capacity(client, CONCURRENCY)
 
-        # Upload the document and get track_id
-        response = await client.insert_text(
-            text,
-            file_source=file_source
-        )
+                # Upload the document and get track_id
+                response = await client.insert_text(
+                    text,
+                    file_source=file_source
+                )
 
-        # Store processing status
-        processing_status = {}
-        if processing_status_file.exists():
-            processing_status = json.loads(processing_status_file.read_text(encoding="utf-8"))
+                # Store processing status
+                processing_status = {}
+                if processing_status_file.exists():
+                    processing_status = json.loads(processing_status_file.read_text(encoding="utf-8"))
 
-        processing_status[str(path)] = {
-            "track_id": response.track_id,
-            "status": "pending",
-            "file_source": file_source
-        }
-        processing_status_file.write_text(json.dumps(processing_status, ensure_ascii=False))
+                processing_status[str(path)] = {
+                    "track_id": response.track_id,
+                    "status": "pending",
+                    "file_source": file_source,
+                    "attempts": attempt + 1
+                }
+                processing_status_file.write_text(json.dumps(processing_status, ensure_ascii=False))
 
-        # Update progress
-        progress = json.loads(status_file.read_text(encoding="utf-8"))
-        progress["processed"] += 1
-        progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        status_file.write_text(json.dumps(progress, ensure_ascii=False))
+                # Update progress
+                progress = json.loads(status_file.read_text(encoding="utf-8"))
+                progress["processed"] += 1
+                progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                status_file.write_text(json.dumps(progress, ensure_ascii=False))
+
+                return  # Success, exit retry loop
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    # Last attempt failed, mark as failed
+                    processing_status = {}
+                    if processing_status_file.exists():
+                        processing_status = json.loads(processing_status_file.read_text(encoding="utf-8"))
+
+                    processing_status[str(path)] = {
+                        "track_id": None,
+                        "status": "failed",
+                        "file_source": file_source,
+                        "error": str(e),
+                        "attempts": attempt + 1
+                    }
+                    processing_status_file.write_text(json.dumps(processing_status, ensure_ascii=False))
+
+                    # Update progress
+                    progress = json.loads(status_file.read_text(encoding="utf-8"))
+                    progress["processed"] += 1
+                    progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    status_file.write_text(json.dumps(progress, ensure_ascii=False))
+
+                    print(f"❌ Failed to upload {path.name} after {max_retries} attempts: {e}")
+                else:
+                    # Wait before retrying
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    print(f"⚠️  Retrying upload of {path.name} (attempt {attempt + 2}/{max_retries})...")
 
 async def check_processing_status(client, processing_status_file: Path):
     """Check and update processing status of documents"""
@@ -91,21 +130,33 @@ async def check_processing_status(client, processing_status_file: Path):
 
     processing_status = json.loads(processing_status_file.read_text(encoding="utf-8"))
     all_done = True
+    max_retries = 3
+    retry_delay = 2  # seconds
 
     for file_path, doc_info in processing_status.items():
         if doc_info["status"] in ["pending", "processing", "preprocessed"]:
-            try:
-                track_status = await client.get_track_status(doc_info["track_id"])
-                # Update status based on the latest track status
-                final_statuses = ["processed", "failed"]
-                doc_status = track_status.documents[0].status if track_status.documents else "unknown"
-                processing_status[file_path]["status"] = doc_status
+            for attempt in range(max_retries):
+                try:
+                    track_status = await client.get_track_status(doc_info["track_id"])
+                    # Update status based on the latest track status
+                    final_statuses = ["processed", "failed"]
+                    doc_status = track_status.documents[0].status if track_status.documents else "unknown"
+                    processing_status[file_path]["status"] = doc_status
 
-                if doc_status not in final_statuses:
-                    all_done = False
-            except Exception:
-                # If tracking fails, assume it's still processing
-                all_done = False
+                    if doc_status not in final_statuses:
+                        all_done = False
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        # Last attempt failed, mark as failed
+                        processing_status[file_path]["status"] = "failed"
+                        processing_status[file_path]["error"] = str(e)
+                        all_done = False
+                        print(f"❌ Failed to check status for {Path(file_path).name}: {e}")
+                    else:
+                        # Wait before retrying
+                        await asyncio.sleep(retry_delay * (attempt + 1))
 
     processing_status_file.write_text(json.dumps(processing_status, ensure_ascii=False))
     return all_done
@@ -117,6 +168,61 @@ async def wait_for_processing_completion(client, processing_status_file: Path):
         if all_done:
             break
         await asyncio.sleep(POLL_INTERVAL)
+
+async def restart_failed_ingestion(root_dir: str):
+    """Restart ingestion for failed documents"""
+    if not PROCESSING_STATUS_FILE.exists():
+        print("❌ No processing status file found")
+        return 1
+
+    processing_status = json.loads(PROCESSING_STATUS_FILE.read_text(encoding="utf-8"))
+    failed_files = []
+
+    # Find all failed documents
+    for file_path, doc_info in processing_status.items():
+        if doc_info.get("status") == "failed":
+            failed_files.append(Path(file_path))
+
+    if not failed_files:
+        print("✅ No failed documents found")
+        return 0
+
+    print(f"🔄 Found {len(failed_files)} failed documents to restart")
+
+    # Update status file to reflect restart
+    if STATUS_FILE.exists():
+        progress = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        progress["done"] = False
+        progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        STATUS_FILE.write_text(json.dumps(progress, ensure_ascii=False))
+
+    client = AsyncLightRagClient(base_url=LIGHTRAG_URL, api_key=API_KEY)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
+    try:
+        # Upload only failed files
+        tasks = [
+            upload_one(semaphore, client, path, STATUS_FILE, PROCESSING_STATUS_FILE)
+            for path in failed_files
+        ]
+        await tqdm_asyncio.gather(*tasks)
+
+        # Wait for all documents to be processed
+        await wait_for_processing_completion(client, PROCESSING_STATUS_FILE)
+
+        # Mark as done
+        progress = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        progress["done"] = True
+        progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        STATUS_FILE.write_text(json.dumps(progress, ensure_ascii=False))
+
+        print("✅ Restart completed successfully")
+        return 0
+    except Exception as e:
+        print(f"❌ Restart failed: {e}")
+        return 1
+    finally:
+        await client.close()
 
 async def ingest_async(root_dir: str, status_file: Path):
     """Main ingestion function"""
@@ -157,6 +263,85 @@ async def ingest_async(root_dir: str, status_file: Path):
 def run_ingestion(root_dir: str):
     """Run ingestion in async context"""
     asyncio.run(ingest_async(root_dir, STATUS_FILE))
+
+def run_restart(root_dir: str):
+    """Run restart in async context"""
+    asyncio.run(restart_failed_ingestion(root_dir))
+
+def start_background_restart(root_dir: str):
+    """Start restart as a background process"""
+    # Check if we're on Windows
+    is_windows = sys.platform.startswith('win')
+
+    if is_windows:
+        try:
+            # Windows approach using start command
+            script_path = os.path.abspath(__file__)
+            current_dir = os.getcwd()
+
+            # Use start command to launch in background
+            command = f'start /B python -c "import sys, os; os.chdir(\'{current_dir}\'); sys.path.insert(0, \'.\'); from lightrag_ingest_cli_upload import run_restart; run_restart(\'{root_dir}\')""'
+            result = os.system(command)
+
+            if result == 0:
+                print("🔄 Restart started in background on Windows")
+                print("Use `status` command to check progress")
+                return 0
+            else:
+                print("❌ Failed to start restart process on Windows")
+                return 1
+        except Exception as e:
+            print(f"❌ Failed to start restart process on Windows: {e}")
+            return 1
+    else:
+        # Unix/Linux approach using nohup for proper process detachment
+        try:
+            # Create a temporary script to run the restart
+            temp_script = f"""#!/bin/bash
+# Run restart in detached mode
+nohup {sys.executable} -c "import sys, os; os.chdir('{os.getcwd()}'); sys.path.insert(0, '.'); from lightrag_ingest_cli_upload import run_restart; run_restart('{root_dir}')" > restart.log 2>&1 &
+echo $! > restart_pid.txt
+"""
+
+            # Write the temporary script
+            with open("restart_temp.sh", "w") as f:
+                f.write(temp_script)
+
+            # Make it executable
+            os.chmod("restart_temp.sh", 0o755)
+
+            # Execute the script
+            result = subprocess.run(["./restart_temp.sh"], capture_output=True, text=True)
+
+            # Clean up
+            if os.path.exists("restart_temp.sh"):
+                os.remove("restart_temp.sh")
+
+            # Read the PID
+            if os.path.exists("restart_pid.txt"):
+                with open("restart_pid.txt", "r") as f:
+                    pid = f.read().strip()
+                os.remove("restart_pid.txt")
+            else:
+                pid = "Unknown"
+
+            if result.returncode == 0:
+                print(f"🔄 Restart started in background (PID={pid})")
+                print("Use `status` command to check progress")
+                print("Process is fully detached and will persist after SSH disconnect")
+                print("Logs are being written to restart.log")
+                return 0
+            else:
+                print(f"❌ Failed to start restart process: {result.stderr}")
+                return 1
+        except Exception as e:
+            print(f"❌ Failed to start restart process: {e}")
+            # Clean up temporary files if they exist
+            if os.path.exists("restart_temp.sh"):
+                os.remove("restart_temp.sh")
+            if os.path.exists("restart_pid.txt"):
+                os.remove("restart_pid.txt")
+            return 1
 
 def find_ingestion_process():
     """Find the ingestion process using psutil"""
@@ -436,6 +621,10 @@ def main():
     start_parser = subparsers.add_parser("start", help="Start background ingestion")
     start_parser.add_argument("root_dir", help="Root directory containing markdown files")
 
+    # Restart command
+    restart_parser = subparsers.add_parser("restart", help="Restart failed documents in background")
+    restart_parser.add_argument("root_dir", help="Root directory containing markdown files")
+
     # Status command
     subparsers.add_parser("status", help="Check ingestion status")
 
@@ -446,6 +635,8 @@ def main():
 
     if args.command == "start":
         return start_background_ingestion(args.root_dir)
+    elif args.command == "restart":
+        return start_background_restart(args.root_dir)
     elif args.command == "status":
         return show_status()
     elif args.command == "stop":
