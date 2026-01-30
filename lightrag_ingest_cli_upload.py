@@ -242,6 +242,16 @@ def show_status():
     print(f"✅ Ingestion Done: {s['done']}")
     print(f"🕒 Last Updated: {s.get('last_modified', 'Unknown')}")
 
+    # Check if the ingestion process still exists
+    proc = find_ingestion_process()
+    if proc:
+        print(f"🔄 Process Status: Running (PID={proc.pid})")
+    else:
+        if s.get('done', False):
+            print("🔄 Process Status: Completed")
+        else:
+            print("⚠️  Process Status: Not found (may have crashed or been stopped)")
+
     # Show detailed processing status if available
     if PROCESSING_STATUS_FILE.exists():
         processing_status = json.loads(PROCESSING_STATUS_FILE.read_text(encoding="utf-8"))
