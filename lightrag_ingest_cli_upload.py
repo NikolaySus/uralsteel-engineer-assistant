@@ -164,10 +164,12 @@ def find_ingestion_process():
     current_dir = os.getcwd()
     current_pid = os.getpid()  # Get current process PID to exclude it
 
-    for proc in psutil.process_iter(['pid', 'cmdline', 'name']):
+    for proc in psutil.process_iter(['pid', 'cmdline', 'name', 'ppid']):
         try:
             cmdline = proc.info['cmdline']
             pid = proc.info['pid']
+            name = proc.info['name']
+            ppid = proc.info.get('ppid', 0)
 
             # Skip the current process (status command)
             if pid == current_pid:
@@ -175,6 +177,15 @@ def find_ingestion_process():
 
             # Skip if no command line
             if not cmdline or len(cmdline) < 1:
+                # Check for Python process by name if no command line
+                if name == 'python' or name == 'python3':
+                    # This might be our ingestion process, check if it has ingestion.log open
+                    try:
+                        for file in proc.open_files():
+                            if 'ingestion.log' in file.path:
+                                return proc
+                    except:
+                        continue
                 continue
 
             # More specific checks for ingestion process
@@ -184,13 +195,28 @@ def find_ingestion_process():
                 return proc
 
             # Check for process started with the specific command pattern
-            if (len(cmdline) >= 2 and cmdline[0].endswith('python') and
+            if (len(cmdline) >= 2 and (cmdline[0].endswith('python') or cmdline[0].endswith('python3')) and
                 any('from lightrag_ingest_cli_upload import run_ingestion' in arg for arg in cmdline)):
                 return proc
 
             # Check for process running the specific ingestion function
             if any('run_ingestion' in arg for arg in cmdline) and not any('status' in arg for arg in cmdline):
                 return proc
+
+            # Check for Python process running our ingestion
+            if (len(cmdline) >= 2 and (cmdline[0].endswith('python') or cmdline[0].endswith('python3')) and
+                any('run_ingestion' in arg for arg in cmdline)):
+                return proc
+
+            # Check for orphaned ingestion processes (parent process ID 1)
+            if ppid == 1 and (name == 'python' or name == 'python3'):
+                # Check if this process has our status files open
+                try:
+                    for file in proc.open_files():
+                        if 'ingest_status.json' in file.path or 'processing_status.json' in file.path:
+                            return proc
+                except:
+                    continue
 
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -352,32 +378,53 @@ def start_background_ingestion(root_dir: str):
             print(f"❌ Failed to start ingestion process on Windows: {e}")
             return 1
     else:
-        # Unix/Linux approach using psutil for proper process detachment
+        # Unix/Linux approach using nohup for proper process detachment
         try:
-            # Start a fully detached process using psutil
-            current_dir = os.getcwd()
+            # Create a temporary script to run the ingestion
+            temp_script = f"""#!/bin/bash
+# Run ingestion in detached mode
+nohup {sys.executable} -c "import sys, os; os.chdir('{os.getcwd()}'); sys.path.insert(0, '.'); from lightrag_ingest_cli_upload import run_ingestion; run_ingestion('{root_dir}')" > ingestion.log 2>&1 &
+echo $! > ingestion_pid.txt
+"""
 
-            # Create a command that will run in a detached process
-            command = [
-                sys.executable,
-                "-c",
-                f"import sys, os; os.chdir('{current_dir}'); sys.path.insert(0, '.'); from lightrag_ingest_cli_upload import run_ingestion; run_ingestion('{root_dir}')"
-            ]
+            # Write the temporary script
+            with open("ingest_temp.sh", "w") as f:
+                f.write(temp_script)
 
-            # Start a fully detached process
-            process = psutil.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True  # This detaches the process
-            )
+            # Make it executable
+            os.chmod("ingest_temp.sh", 0o755)
 
-            print(f"🚀 Ingestion started in background (PID={process.pid})")
-            print("Use `status` command to check progress")
-            print("Process is fully detached and will persist after SSH disconnect")
-            return 0
+            # Execute the script
+            result = subprocess.run(["./ingest_temp.sh"], capture_output=True, text=True)
+
+            # Clean up
+            if os.path.exists("ingest_temp.sh"):
+                os.remove("ingest_temp.sh")
+
+            # Read the PID
+            if os.path.exists("ingestion_pid.txt"):
+                with open("ingestion_pid.txt", "r") as f:
+                    pid = f.read().strip()
+                os.remove("ingestion_pid.txt")
+            else:
+                pid = "Unknown"
+
+            if result.returncode == 0:
+                print(f"🚀 Ingestion started in background (PID={pid})")
+                print("Use `status` command to check progress")
+                print("Process is fully detached and will persist after SSH disconnect")
+                print("Logs are being written to ingestion.log")
+                return 0
+            else:
+                print(f"❌ Failed to start ingestion process: {result.stderr}")
+                return 1
         except Exception as e:
             print(f"❌ Failed to start ingestion process: {e}")
+            # Clean up temporary files if they exist
+            if os.path.exists("ingest_temp.sh"):
+                os.remove("ingest_temp.sh")
+            if os.path.exists("ingestion_pid.txt"):
+                os.remove("ingestion_pid.txt")
             return 1
 
 def main():
