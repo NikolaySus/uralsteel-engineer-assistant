@@ -61,6 +61,21 @@ def fetch_indexed_paths():
         return set()
 
 
+def reprocess_failed_documents():
+    """Trigger reprocessing of failed documents (no payload; service handles all failed)."""
+    url = f"{LIGHTRAG_URL}/documents/reprocess_failed"
+    headers = {"accept": "application/json", "content-type": "application/json"}
+    if API_KEY:
+        headers["x-api-key"] = API_KEY
+
+    try:
+        response = requests.post(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        print("🔁 Reprocess requested for all failed documents")
+    except Exception as e:
+        print(f"⚠️  Reprocess request failed: {e}")
+
+
 async def wait_for_processing(client: AsyncLightRagClient, track_id: str, file_path: Path):
     """Poll track status until it reaches a final state or exhausts attempts."""
     attempts = 0
@@ -84,7 +99,7 @@ async def wait_for_processing(client: AsyncLightRagClient, track_id: str, file_p
     raise RuntimeError(f"Status polling exceeded max attempts for {file_path.name}")
 
 
-async def process_file(client: AsyncLightRagClient, path: Path):
+async def process_file(client: AsyncLightRagClient, path: Path, reprocess_on_fail: bool):
     """Upload one file and wait until it is fully processed."""
     print(f"➡️  Uploading: {path}")
 
@@ -97,19 +112,30 @@ async def process_file(client: AsyncLightRagClient, path: Path):
     except Exception as e:
         raise RuntimeError(f"Upload failed for {path.name}: {e}") from e
 
-    # Wait for completion
-    try:
-        final_status = await wait_for_processing(client, response.track_id, path)
-    except Exception as e:
-        raise RuntimeError(f"Processing check failed for {path.name}: {e}") from e
+    # Wait for completion, optionally reprocess and retry until processed
+    attempts = 0
+    while True:
+        try:
+            final_status = await wait_for_processing(client, response.track_id, path)
+        except Exception as e:
+            raise RuntimeError(f"Processing check failed for {path.name}: {e}") from e
 
-    if final_status != "processed":
-        raise RuntimeError(f"Processing ended with status '{final_status}' for {path.name}")
+        if final_status == "processed":
+            print(f"✅ Done: {path}")
+            return
 
-    print(f"✅ Done: {path}")
+        # final_status is failed
+        if not reprocess_on_fail:
+            raise RuntimeError(f"Processing ended with status '{final_status}' for {path.name}")
+
+        attempts += 1
+        print(f"🔁 Reprocess attempt {attempts} for {path}")
+        reprocess_failed_documents()
+        await asyncio.sleep(POLL_INTERVAL)
 
 
-async def ingest_sequential(root_dir: str, path_regex: str | None = None):
+
+async def ingest_sequential(root_dir: str, path_regex: str | None = None, reprocess_on_fail: bool = False):
     files = collect_markdown_files(root_dir, path_regex)
     indexed_paths = fetch_indexed_paths()
 
@@ -132,9 +158,9 @@ async def ingest_sequential(root_dir: str, path_regex: str | None = None):
         for idx, path in enumerate(files, start=1):
             print(f"\n📄 [{idx}/{total}] {path.name}")
             try:
-                await process_file(client, path)
+                await process_file(client, path, reprocess_on_fail)
             except Exception as e:
-                print(f"❌ Aborting on failure: {e}")
+                print(f"❌ Error: {e}")
                 return 1
 
         print("\n🏁 All files processed successfully.")
@@ -151,10 +177,17 @@ def main():
         dest="path_regex",
         help="Regex applied to full file path (use forward slashes). Example: '.*Маршрутные карты УТСП/\\d{3}мк от.*'",
     )
+    parser.add_argument(
+        "--reprocess-on-fail",
+        action="store_true",
+        help="If a file fails after upload, call POST /documents/reprocess_failed and retry the same file until it is processed (up to retries).",
+    )
     args = parser.parse_args()
 
     try:
-        exit_code = asyncio.run(ingest_sequential(args.root_dir, args.path_regex))
+        exit_code = asyncio.run(
+            ingest_sequential(args.root_dir, args.path_regex, args.reprocess_on_fail)
+        )
     except KeyboardInterrupt:
         print("\n⚠️  Interrupted by user. Exiting.")
         exit_code = 1
