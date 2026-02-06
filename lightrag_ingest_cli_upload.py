@@ -15,6 +15,7 @@ import argparse
 import multiprocessing
 import subprocess
 import psutil
+import requests
 from pathlib import Path
 from lightrag.api import AsyncLightRagClient
 from tqdm.asyncio import tqdm_asyncio
@@ -35,6 +36,21 @@ POLL_INTERVAL = 5  # seconds between status checks
 def collect_markdown_files(root: str):
     """Collect all markdown files recursively from a directory"""
     return sorted(Path(root).rglob("*.md"))
+
+
+def fetch_indexed_paths():
+    """Fetch already indexed file paths from LightRag service"""
+    url = f"{LIGHTRAG_URL}/documents"
+    headers = {"accept": "application/json"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return set(chunk.get("file_path") for chunk in data.get("statuses", {}).get("processed", []) if chunk.get("file_path"))
+    except Exception as e:
+        print(f"⚠️  Warning: could not fetch indexed paths, proceeding without skip check. Error: {e}")
+        return set()
 
 async def wait_for_capacity(client, max_concurrent: int):
     """Wait until there's capacity in the processing pipeline"""
@@ -227,12 +243,21 @@ async def restart_failed_ingestion(root_dir: str):
 async def ingest_async(root_dir: str, status_file: Path):
     """Main ingestion function"""
     files = collect_markdown_files(root_dir)
+    indexed_paths = fetch_indexed_paths()
 
-    # Initialize status files
+    if indexed_paths:
+        original_total = len(files)
+        files = [p for p in files if str(p) not in indexed_paths]
+        skipped = original_total - len(files)
+        if skipped:
+            print(f"ℹ️  Skipping {skipped} already indexed file(s)")
+
+    # Initialize status files with filtered total
+    total_files = len(files)
     status_file.write_text(json.dumps({
         "processed": 0,
-        "total": len(files),
-        "done": False,
+        "total": total_files,
+        "done": total_files == 0,
         "last_modified": time.strftime("%Y-%m-%d %H:%M:%S")
     }, ensure_ascii=False))
 
@@ -242,17 +267,19 @@ async def ingest_async(root_dir: str, status_file: Path):
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
     try:
-        # Upload all files first
-        tasks = [
-            upload_one(semaphore, client, path, status_file, PROCESSING_STATUS_FILE)
-            for path in files
-        ]
-        await tqdm_asyncio.gather(*tasks)
+        # Nothing to do if all files were already indexed
+        if files:
+            # Upload all files first
+            tasks = [
+                upload_one(semaphore, client, path, status_file, PROCESSING_STATUS_FILE)
+                for path in files
+            ]
+            await tqdm_asyncio.gather(*tasks)
 
-        # Wait for all documents to be processed
-        await wait_for_processing_completion(client, PROCESSING_STATUS_FILE)
+            # Wait for all documents to be processed
+            await wait_for_processing_completion(client, PROCESSING_STATUS_FILE)
 
-        # Mark as done
+        # Mark as done (handles case where there were zero files to ingest)
         progress = json.loads(status_file.read_text(encoding="utf-8"))
         progress["done"] = True
         progress["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
