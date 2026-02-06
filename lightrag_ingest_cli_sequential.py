@@ -27,7 +27,8 @@ from lightrag.api import AsyncLightRagClient
 LIGHTRAG_URL = "http://localhost:9621"
 API_KEY = None
 POLL_INTERVAL = 5  # seconds between status checks
-MAX_STATUS_ATTEMPTS = 120  # ~10 minutes max per file with default poll interval
+# Allow generous processing time to avoid premature timeout; configurable via CLI
+MAX_STATUS_ATTEMPTS = 720  # 720 * 5s = 3600s (~1 hour) per processing cycle
 
 
 # --------------------------
@@ -65,9 +66,6 @@ def reprocess_failed_documents():
     """Trigger reprocessing of failed documents (no payload; service handles all failed)."""
     url = f"{LIGHTRAG_URL}/documents/reprocess_failed"
     headers = {"accept": "application/json", "content-type": "application/json"}
-    if API_KEY:
-        headers["x-api-key"] = API_KEY
-
     try:
         response = requests.post(url, headers=headers, timeout=15)
         response.raise_for_status()
@@ -92,6 +90,7 @@ async def wait_for_processing(client: AsyncLightRagClient, track_id: str, file_p
 
             await asyncio.sleep(POLL_INTERVAL)
         except Exception as e:
+            # Treat transient errors (network/timeouts) as retryable until max attempts
             if attempts >= MAX_STATUS_ATTEMPTS:
                 raise RuntimeError(f"Status polling failed for {file_path.name}: {e}") from e
             await asyncio.sleep(POLL_INTERVAL)
@@ -118,6 +117,13 @@ async def process_file(client: AsyncLightRagClient, path: Path, reprocess_on_fai
         try:
             final_status = await wait_for_processing(client, response.track_id, path)
         except Exception as e:
+            # Treat polling failure as retryable when reprocess is requested
+            if reprocess_on_fail:
+                attempts += 1
+                print(f"🔁 Polling error, reprocess attempt {attempts} for {path}: {e}")
+                reprocess_failed_documents()
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
             raise RuntimeError(f"Processing check failed for {path.name}: {e}") from e
 
         if final_status == "processed":
