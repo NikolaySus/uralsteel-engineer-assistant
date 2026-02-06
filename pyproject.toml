@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.13.3",
     "lightrag-api>=0.1.4",
+    "minio>=7.2.20",
     "psutil>=7.2.2",
     "python-dotenv>=1.2.1",
     "tqdm>=4.67.1",
