@@ -36,6 +36,7 @@ MD_ENABLE_LLM_TABLE_ENHANCEMENT = os.environ.get("MD_ENABLE_LLM_TABLE_ENHANCEMEN
 MD_CLIENT   = OpenAI(base_url=MD_BASE_URL, api_key=MD_API_KEY) if MD_ENABLE_LLM_TABLE_ENHANCEMENT else None
 
 FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS", "0").lower() in {"1", "true", "yes"}
+APPEND_MODE = os.environ.get("APPEND_MODE", "1").lower() in {"1", "true", "yes"}
 MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.35"))
 MATCH_ORDER_WEIGHT = float(os.environ.get("MATCH_ORDER_WEIGHT", "0.40"))
 MATCH_AMBIGUITY_GAP = float(os.environ.get("MATCH_AMBIGUITY_GAP", "0.03"))
@@ -652,9 +653,15 @@ if __name__ == "__main__":
         print(f"{'='*70}")
 
         output_exists = os.path.exists(output_path)
+        prev_extracted_count = get_existing_dbg_table_count(doc_name_no_ext)
 
-        # Always re-check extracted table count from PDF.
-        # For already-enhanced docs we only reprocess when count increased.
+        # If enhanced output already exists, do not re-open/extract this document
+        # unless FORCE_REPROCESS is explicitly enabled.
+        if output_exists and not FORCE_REPROCESS:
+            print(f"Skipping document (already enhanced): {output_path}")
+            continue
+
+        # Extract current table count from PDF for non-enhanced (or forced) docs.
         try:
             tables = extract_tables_from_pdf(
                 pdf_path,
@@ -667,30 +674,34 @@ if __name__ == "__main__":
             print(f"Error extracting tables from PDF: {e}")
             continue
 
-        prev_extracted_count = get_existing_dbg_table_count(doc_name_no_ext)
         current_extracted_count = len(tables)
-
-        if output_exists and not FORCE_REPROCESS:
-            if current_extracted_count <= prev_extracted_count:
-                print(
-                    f"Skipping document (already enhanced): {output_path}. "
-                    f"Extracted tables did not increase ({current_extracted_count} <= {prev_extracted_count})."
-                )
-                continue
-
-            print(
-                f"Reprocessing document because extracted table count increased "
-                f"({prev_extracted_count} -> {current_extracted_count})."
-            )
         
-        # Read original markdown
+        append_processing = (
+            APPEND_MODE
+            and not output_exists
+            and not FORCE_REPROCESS
+            and prev_extracted_count > 0
+            and current_extracted_count > prev_extracted_count
+        )
+
+        # For non-enhanced docs, base markdown source is the original markdown.
+        markdown_source_path = md_path
         markdown_text = ""
-        with open(md_path, 'r', encoding="utf-8") as file:
+        with open(markdown_source_path, 'r', encoding="utf-8") as file:
             markdown_text = file.read()
+
+        if append_processing:
+            print(
+                f"Append mode: reusing existing debug artifacts for first {prev_extracted_count} tables "
+                f"and continuing OCR from table {prev_extracted_count + 1} to {current_extracted_count}."
+            )
         
         # Extract existing tables from markdown
         existing_tables = extract_html_tables_from_markdown(markdown_text)
         print(f"Found {len(existing_tables)} existing HTML tables in markdown")
+
+        match_tables = existing_tables
+        match_index_offset = 0
         
         tables_images = batch_rotate_tables_90deg_pil(
             tables,
@@ -789,16 +800,23 @@ if __name__ == "__main__":
             print("done")
         
         # Fuzzy match and update markdown
-        print(f"\nMatching {len(final_code)} extracted tables with {len(existing_tables)} existing...")
+        print(f"\nMatching {len(final_code)} extracted tables with {len(match_tables)} existing...")
+        effective_order_weight = 0.0 if append_processing else MATCH_ORDER_WEIGHT
         matched_updates = fuzzy_match_tables_improved(
             final_code,
-            existing_tables,
+            match_tables,
             markdown_text,
             threshold=MATCH_THRESHOLD,
-            order_weight=MATCH_ORDER_WEIGHT,
+            order_weight=effective_order_weight,
             ambiguity_gap=MATCH_AMBIGUITY_GAP,
             strict_ambiguity=MATCH_STRICT_AMBIGUITY,
         )
+
+        # Remap local indices from sliced match_tables back to full existing_tables indices.
+        if match_index_offset:
+            for match in matched_updates:
+                if match.get('table_indices'):
+                    match['table_indices'] = [idx + match_index_offset for idx in match['table_indices']]
         print(f"Found {len(matched_updates)} matches")
 
         matched_table_replacements = sum(
@@ -809,7 +827,7 @@ if __name__ == "__main__":
                 doc_name=pdf_name,
                 extracted_tables=len(final_code),
                 matched_tables=matched_table_replacements,
-                existing_tables=len(existing_tables),
+                existing_tables=len(match_tables),
                 output_path=output_path,
             )
             print(

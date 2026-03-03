@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tables import (
@@ -11,6 +12,7 @@ from tables import (
     MD_DIR,
     DBG_DIR,
     FORCE_REPROCESS,
+    APPEND_MODE,
     MATCH_THRESHOLD,
     MATCH_ORDER_WEIGHT,
     MATCH_AMBIGUITY_GAP,
@@ -87,9 +89,15 @@ def process_one_document(pdf_idx: int, pdf_name: str, total_docs: int, stop_even
     log(f"\n{'='*70}\n[{pdf_idx+1}/{total_docs}] Processing: {pdf_name}\n{'='*70}")
 
     output_exists = os.path.exists(output_path)
+    prev_extracted_count = get_existing_dbg_table_count(doc_name_no_ext)
 
-    # Always re-check extracted table count from PDF.
-    # For already-enhanced docs we only reprocess when count increased.
+    # If enhanced output already exists, do not re-open/extract this document
+    # unless FORCE_REPROCESS is explicitly enabled.
+    if output_exists and not FORCE_REPROCESS:
+        log(f"Skipping document (already enhanced): {output_path}")
+        return pdf_name, "skipped"
+
+    # Extract current table count from PDF for non-enhanced (or forced) docs.
     try:
         tables = extract_tables_from_pdf(
             pdf_path,
@@ -104,35 +112,38 @@ def process_one_document(pdf_idx: int, pdf_name: str, total_docs: int, stop_even
 
     current_extracted_count = len(tables)
 
-    with state_lock:
-        prev_extracted_count = get_existing_dbg_table_count(doc_name_no_ext)
+    append_processing = (
+        APPEND_MODE
+        and not output_exists
+        and not FORCE_REPROCESS
+        and prev_extracted_count > 0
+        and current_extracted_count > prev_extracted_count
+    )
 
-        if output_exists and not FORCE_REPROCESS:
-            if current_extracted_count <= prev_extracted_count:
-                log(
-                    f"Skipping document (already enhanced): {output_path}. "
-                    f"Extracted tables did not increase "
-                    f"({current_extracted_count} <= {prev_extracted_count})."
-                )
-                return pdf_name, "skipped"
-
-            log(
-                f"Reprocessing document because extracted table count increased "
-                f"({prev_extracted_count} -> {current_extracted_count})."
-            )
+    markdown_source_path = md_path
 
     try:
-        with open(md_path, 'r', encoding="utf-8") as file:
+        with open(markdown_source_path, 'r', encoding="utf-8") as file:
             markdown_text = file.read()
     except Exception as e:
-        log(f"Error reading markdown {md_path}: {e}")
+        log(f"Error reading markdown {markdown_source_path}: {e}")
         return pdf_name, "error"
+
+    if append_processing:
+        log(
+            f"[{pdf_name}] Append mode: reusing existing debug artifacts for first "
+            f"{prev_extracted_count} tables and continuing OCR from table "
+            f"{prev_extracted_count + 1} to {current_extracted_count}."
+        )
 
     if stop_event.is_set():
         return pdf_name, "stopped"
 
     existing_tables = extract_html_tables_from_markdown(markdown_text)
     log(f"Found {len(existing_tables)} existing HTML tables in markdown for {pdf_name}")
+
+    match_tables = existing_tables
+    match_index_offset = 0
 
     if stop_event.is_set():
         return pdf_name, "stopped"
@@ -213,13 +224,18 @@ def process_one_document(pdf_idx: int, pdf_name: str, total_docs: int, stop_even
 
     matched_updates = fuzzy_match_tables_improved(
         final_code,
-        existing_tables,
+        match_tables,
         markdown_text,
         threshold=MATCH_THRESHOLD,
-        order_weight=MATCH_ORDER_WEIGHT,
+        order_weight=0.0 if append_processing else MATCH_ORDER_WEIGHT,
         ambiguity_gap=MATCH_AMBIGUITY_GAP,
         strict_ambiguity=MATCH_STRICT_AMBIGUITY,
     )
+
+    if match_index_offset:
+        for match in matched_updates:
+            if match.get('table_indices'):
+                match['table_indices'] = [idx + match_index_offset for idx in match['table_indices']]
     log(f"[{pdf_name}] Found {len(matched_updates)} matches")
 
     matched_table_replacements = sum(
@@ -230,7 +246,7 @@ def process_one_document(pdf_idx: int, pdf_name: str, total_docs: int, stop_even
             doc_name=pdf_name,
             extracted_tables=len(final_code),
             matched_tables=matched_table_replacements,
-            existing_tables=len(existing_tables),
+            existing_tables=len(match_tables),
             output_path=output_path,
         )
         log(
@@ -339,6 +355,7 @@ def main() -> None:
                 except Exception as e:
                     log(f"[{pdf_name}] Unhandled worker error: {e}")
                     status = "error"
+                    traceback.print_exc()
 
                 if status == "done":
                     done += 1
@@ -356,7 +373,8 @@ def main() -> None:
     log("\n" + "=" * 70)
     log(f"Completed. done={done}, skipped={skipped}, errors={errors}")
     if failed_with_error:
-        log(f"Docs failed with error: {',\n'.join(failed_with_error)}")
+        failed_docs = ",\n".join(failed_with_error)
+        log(f"Docs failed with error: {failed_docs}")
     log("=" * 70)
 
 
