@@ -28,7 +28,7 @@ from lightrag.api import AsyncLightRagClient
 # --------------------------
 # CONFIG
 # --------------------------
-LIGHTRAG_URL = "http://localhost:9621"
+LIGHTRAG_URL = "http://localhost:9622"
 API_KEY = None
 POLL_INTERVAL = 5  # seconds between status checks
 MAX_STATUS_ATTEMPTS = 720  # 720 * 5s = 3600s (~1 hour) per processing cycle
