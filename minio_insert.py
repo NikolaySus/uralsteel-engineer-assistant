@@ -6,6 +6,7 @@ import re
 import subprocess
 import uuid
 import asyncio
+import argparse
 
 import httpx
 from minio import Minio
@@ -39,17 +40,18 @@ def sanitize_bucket_name(bucket_name):
     return sanitized
 
 
-def get_all_pdf_files(source_dir):
-    """Get all PDF files from source directory and subdirectories."""
-    pdf_files = []
-    for root, dirs, files in os.walk(source_dir):
-        for file in files:
-            if file.lower().endswith('.pdf'):
+def get_all_files(source_dir, extension):
+    """Get all files with specified extension from source directory and subdirectories."""
+    files = []
+    ext = f'.{extension}' if not extension.startswith('.') else extension
+    for root, dirs, filenames in os.walk(source_dir):
+        for file in filenames:
+            if file.lower().endswith(ext.lower()):
                 full_path = os.path.join(root, file)
                 # Get relative path from source directory
                 rel_path = os.path.relpath(full_path, source_dir)
-                pdf_files.append((full_path, rel_path))
-    return pdf_files
+                files.append((full_path, rel_path))
+    return files
 
 
 def normalize_path(path):
@@ -57,7 +59,7 @@ def normalize_path(path):
     return path.replace('\\', '/')
 
 
-def upload_file_to_minio(minio_client, bucket_name, file_path, object_name):
+def upload_file_to_minio(minio_client, bucket_name, file_path, object_name, content_type):
     """Upload a single file to MinIO."""
     try:
         with open(file_path, 'rb') as file_data:
@@ -67,7 +69,7 @@ def upload_file_to_minio(minio_client, bucket_name, file_path, object_name):
                 object_name,
                 file_data,
                 file_stat.st_size,
-                content_type='application/pdf'
+                content_type=content_type
             )
         print(f"Uploaded: {object_name}")
         return True
@@ -77,12 +79,27 @@ def upload_file_to_minio(minio_client, bucket_name, file_path, object_name):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Upload files to MinIO based on file extension')
+    parser.add_argument('extension', choices=['pdf', 'md'], help='File extension to upload (pdf or md)')
+    args = parser.parse_args()
+    
+    file_extension = args.extension
+    
+    # Set content type based on extension
+    content_type_map = {
+        'pdf': 'application/pdf',
+        'md': 'text/markdown'
+    }
+    content_type = content_type_map[file_extension]
+    
     # Extract bucket name from source directory and sanitize it
     original_bucket_name = os.path.basename(SOURCE_DIR)
     bucket_name = sanitize_bucket_name(original_bucket_name)
     
     print(f"Original directory name: {original_bucket_name}")
     print(f"Sanitized bucket name: {bucket_name}")
+    print(f"File extension to upload: .{file_extension}\n")
     
     # Initialize MinIO client
     if not all([MINIO_ADDRESS, MINIO_ACCESS_KEY, MINIO_SECRET_KEY]):
@@ -107,22 +124,22 @@ def main():
         print(f"Error creating bucket {bucket_name}: {e}")
         return  # Exit if bucket creation fails
     
-    # Get all PDF files
-    print(f"\nScanning for PDF files in: {SOURCE_DIR}")
-    pdf_files = get_all_pdf_files(SOURCE_DIR)
-    print(f"Found {len(pdf_files)} PDF file(s)")
+    # Get all files with specified extension
+    print(f"\nScanning for .{file_extension} files in: {SOURCE_DIR}")
+    files = get_all_files(SOURCE_DIR, file_extension)
+    print(f"Found {len(files)} .{file_extension} file(s)")
     
     # Upload files
     uploaded_count = 0
-    for full_path, rel_path in pdf_files:
+    for full_path, rel_path in files:
         # Normalize path (replace backslashes with forward slashes)
         object_name = normalize_path(rel_path)
         
         print(f"Processing: {full_path} -> {object_name}")
-        if upload_file_to_minio(minio_client, bucket_name, full_path, object_name):
+        if upload_file_to_minio(minio_client, bucket_name, full_path, object_name, content_type):
             uploaded_count += 1
     
-    print(f"\nUpload complete: {uploaded_count}/{len(pdf_files)} files uploaded successfully")
+    print(f"\nUpload complete: {uploaded_count}/{len(files)} files uploaded successfully")
     
     # List files in bucket for validation
     print(f"\nListing files in bucket '{bucket_name}':")
