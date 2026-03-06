@@ -16,7 +16,7 @@ MINIO_ADDRESS = os.environ.get('MINIO_ADDRESS', '')
 MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY', None)
 MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', None)
 
-SOURCE_DIR = r"C:\Users\gorku\Documents\Технологические письма\hierarchy_trailing_20260126_182731"
+SOURCE_DIR = r"/root/rag-source/hierarchy_trailing_20260126_182731"
 
 
 def sanitize_bucket_name(bucket_name):
