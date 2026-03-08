@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.13.3",
+    "diff-match-patch>=20241021",
     "imgkit>=1.2.3",
     "lightrag-api>=0.1.4",
     "minio>=7.2.20",
